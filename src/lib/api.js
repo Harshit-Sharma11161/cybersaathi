@@ -1,9 +1,13 @@
 import { supabase } from './supabase.js'
 
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || ''
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || ''
 
 async function callEdgeFunction(slug, body) {
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    throw new Error('Supabase is not configured. Please set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY environment variables.')
+  }
+
   const url = `${SUPABASE_URL}/functions/v1/${slug}`
   const headers = {
     'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
