@@ -26,7 +26,7 @@ Common examples include:
 - 🔑 OTP, PIN, password and credential theft
 - 😨 Urgency and fear-based social engineering
 
-The challenge is:
+The challenge is:-
 
 > **How can an ordinary user quickly understand whether a digital message or URL is actually dangerous?**
 
