@@ -386,7 +386,7 @@ function getDemoUrlResponse(url) {
     summary: `This URL shows ${flags.length} suspicious indicator(s): ${flags.slice(0, 3).join(', ')}.`,
     redFlags: flags,
     recommendations: generateRecommendations(category, flags),
-    hindiExplanation: generateHindiExplanation(getRiskLevel(score), flags),
+    hindiExplanation: generateHindiExplanation(category, getRiskLevel(score), flags),
   }
 }
 
