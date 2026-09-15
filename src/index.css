@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-cyber-border;
+  }
+  body {
+    @apply bg-cyber-bg text-cyber-text font-sans antialiased;
+    background-image: theme('backgroundImage.cyber-radial'), theme('backgroundImage.cyber-grid');
+    background-size: 100% 100%, 40px 40px;
+    min-height: 100vh;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-cyber-card/60 backdrop-blur-xl border border-cyber-border/50 rounded-2xl;
+  }
+  .glass-card-hover {
+    @apply glass-card transition-all duration-300 hover:border-cyber-accent/40 hover:shadow-lg hover:shadow-cyber-accent/10;
+  }
+  .btn-primary {
+    @apply bg-cyber-accent text-cyber-bg font-semibold px-6 py-3 rounded-xl transition-all duration-300 hover:bg-cyber-accent2 hover:shadow-lg hover:shadow-cyber-accent/30 active:scale-95;
+  }
+  .btn-secondary {
+    @apply bg-cyber-surface border border-cyber-border text-cyber-text font-medium px-6 py-3 rounded-xl transition-all duration-300 hover:border-cyber-accent/40 active:scale-95;
+  }
+  .input-field {
+    @apply w-full bg-cyber-surface/80 border border-cyber-border rounded-xl px-4 py-3 text-cyber-text placeholder-cyber-muted focus:outline-none focus:border-cyber-accent focus:ring-1 focus:ring-cyber-accent/30 transition-all duration-200;
+  }
+  .section-title {
+    @apply text-xs font-mono uppercase tracking-widest text-cyber-accent mb-3;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0a0e17;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3454;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #00d4ff;
+}
+
+/* Text selection */
+::selection {
+  background: rgba(0, 212, 255, 0.3);
+  color: #e2e8f0;
+}

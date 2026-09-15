@@ -1,0 +1,575 @@
+import { createClient } from "npm:@supabase/supabase-js@2.45.4";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+};
+
+interface AnalysisResult {
+  riskScore: number;
+  riskLevel: string;
+  category: string;
+  summary: string;
+  redFlags: string[];
+  recommendations: string[];
+  hindiExplanation: string;
+  demoMode: boolean;
+}
+
+// ─── Deterministic security rules ───────────────────────────────────
+const PHISHING_KEYWORDS = [
+  "kyc", "account will be blocked", "account is blocked", "urgent",
+  "verify your account", "click here", "suspended", "immediately",
+  "otp", "password", "login", "confirm your details", "update your",
+  "verify now", "action required", "limited access", "security alert",
+];
+
+const BANKING_KEYWORDS = [
+  "sbi", "hdfc", "icici", "axis", "kotak", "punjab national", "bank of baroda",
+  "canara", "union bank", "bank", "atm", "debit card", "credit card",
+  "account", "cheque", "ifsc", "branch",
+];
+
+const JOB_KEYWORDS = [
+  "job offer", "selected for", "congratulations you have been",
+  "work from home", "earn money", "part time job", "data entry",
+  "salary", "hiring", "recruitment", "candidate selected",
+  "company has shortlisted", "interview scheduled",
+];
+
+const UPI_KEYWORDS = [
+  "upi", "paytm", "phonepe", "gpay", "google pay", "bhim",
+  "send money", "payment", "transfer", "refund", "cashback",
+  "receive money", "payment pending",
+];
+
+const LOTTERY_KEYWORDS = [
+  "lottery", "winner", "congratulations you won", "prize",
+  "lucky draw", "selected for prize", "claim your", "reward",
+  "you have won", "jackpot", "mega prize",
+];
+
+const URGENCY_PHRASES = [
+  "urgent", "immediately", "today", "within 24 hours", "now",
+  "before", "last chance", "final notice", "expires", "hurry",
+  "act now", "don't delay", "limited time",
+];
+
+const URL_REGEX = /https?:\/\/[^\s]+|www\.[^\s]+|[a-z0-9-]+\.(com|in|net|org|co|xyz|info|click|top|live|online|site|app|io|me|cc|tk|ml|ga|cf)[^\s]*/gi;
+
+function extractUrls(text: string): string[] {
+  return text.match(URL_REGEX) || [];
+}
+
+function hasKeyword(text: string, keywords: string[]): boolean {
+  const lower = text.toLowerCase();
+  return keywords.some((k) => lower.includes(k));
+}
+
+function countKeywordMatches(text: string, keywords: string[]): string[] {
+  const lower = text.toLowerCase();
+  return keywords.filter((k) => lower.includes(k));
+}
+
+function analyzeUrlString(url: string): { flags: string[]; score: number } {
+  const flags: string[] = [];
+  let score = 0;
+  const lower = url.toLowerCase();
+
+  // IP address as domain
+  if (/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/.test(lower)) {
+    flags.push("Uses IP address instead of domain name");
+    score += 20;
+  }
+
+  // Excessive subdomains
+  const subdomainCount = (lower.match(/\./g) || []).length;
+  if (subdomainCount > 3) {
+    flags.push(`Excessive subdomains (${subdomainCount} dots) — possible spoofing`);
+    score += 15;
+  }
+
+  // Misleading domain patterns
+  const misleadingPatterns = [
+    { pattern: /sb[i1l]/i, real: "sbi" },
+    { pattern: /hdfc|hdfe/i, real: "hdfc" },
+    { pattern: /ic[i1l]c[i1l]/i, real: "icici" },
+    { pattern: /paytm|paytym/i, real: "paytm" },
+    { pattern: /ph0nep[e3]/i, real: "phonepe" },
+  ];
+  for (const { pattern, real } of misleadingPatterns) {
+    if (pattern.test(lower) && !lower.includes(`${real}.`)) {
+      flags.push(`Misspelled/lookalike domain (mimics "${real}")`);
+      score += 20;
+      break;
+    }
+  }
+
+  // Suspicious TLDs
+  const suspiciousTlds = [".xyz", ".top", ".click", ".tk", ".ml", ".ga", ".cf", ".live", ".online", ".site", ".cc"];
+  if (suspiciousTlds.some((tld) => lower.endsWith(tld) || lower.includes(`${tld}/`) || lower.includes(`${tld}?`))) {
+    flags.push("Uses a suspicious top-level domain");
+    score += 15;
+  }
+
+  // Excessive URL parameters
+  const paramCount = (url.match(/[?&]/g) || []).length;
+  if (paramCount > 4) {
+    flags.push(`Excessive URL parameters (${paramCount}) — possible tracking/phishing`);
+    score += 15;
+  }
+
+  // Phishing keywords in URL
+  const urlPhishingKw = ["login", "verify", "account", "update", "secure", "confirm", "kyc", "otp", "password", "unlock", "activate"];
+  if (urlPhishingKw.some((kw) => lower.includes(kw))) {
+    flags.push("Phishing-related keywords in URL path");
+    score += 15;
+  }
+
+  // URL shortener
+  const shorteners = ["bit.ly", "tinyurl", "t.co", "goo.gl", "shorturl", "is.gd", "buff.ly", "rebrand.ly"];
+  if (shorteners.some((s) => lower.includes(s))) {
+    flags.push("Uses URL shortener — destination is hidden");
+    score += 15;
+  }
+
+  // Non-HTTPS
+  if (lower.startsWith("http://")) {
+    flags.push("Not using HTTPS (insecure connection)");
+    score += 10;
+  }
+
+  return { flags, score: Math.min(score, 60) };
+}
+
+function deterministicAnalyze(input: string): Partial<AnalysisResult> {
+  const redFlags: string[] = [];
+  let score = 0;
+  let category = "Unknown";
+
+  // Extract and analyze URLs
+  const urls = extractUrls(input);
+  for (const url of urls) {
+    const urlAnalysis = analyzeUrlString(url);
+    redFlags.push(...urlAnalysis.flags);
+    score += urlAnalysis.score;
+  }
+
+  // Check for urgency
+  const urgencyMatches = countKeywordMatches(input, URGENCY_PHRASES);
+  if (urgencyMatches.length > 0) {
+    redFlags.push(`Urgency/fear manipulation (${urgencyMatches.slice(0, 3).join(", ")})`);
+    score += 15;
+  }
+
+  // Check for money/financial requests
+  if (hasKeyword(input, ["send money", "transfer", "deposit", "pay now", "payment", "fees", "registration fee", "processing fee"])) {
+    redFlags.push("Requests for money or payment");
+    score += 15;
+  }
+
+  // Check for credential requests
+  if (hasKeyword(input, ["otp", "password", "pin", "cvv", "card number", "login details", "credentials"])) {
+    redFlags.push("Requests for sensitive credentials (OTP, password, PIN)");
+    score += 20;
+  }
+
+  // Determine category
+  if (hasKeyword(input, LOTTERY_KEYWORDS)) {
+    category = "Lottery/Prize Scam";
+    if (!redFlags.some((f) => f.includes("lottery"))) redFlags.push("False lottery/prize notification");
+    score += 15;
+  } else if (hasKeyword(input, JOB_KEYWORDS)) {
+    category = "Fake Job Offer";
+    if (!redFlags.some((f) => f.includes("job"))) redFlags.push("Unsolicited job offer with unrealistic promises");
+    score += 15;
+  } else if (hasKeyword(input, UPI_KEYWORDS)) {
+    category = "UPI/Payment Scam";
+    if (!redFlags.some((f) => f.includes("payment"))) redFlags.push("Suspicious payment/UPI request");
+    score += 10;
+  } else if (hasKeyword(input, BANKING_KEYWORDS) || hasKeyword(input, PHISHING_KEYWORDS)) {
+    category = "Banking/Phishing Scam";
+    if (!redFlags.some((f) => f.includes("phishing"))) redFlags.push("Banking account phishing attempt");
+    score += 10;
+  } else if (urls.length > 0) {
+    category = "Phishing";
+    score += 10;
+  } else if (score === 0) {
+    category = "Safe/Informational";
+  }
+
+  // Deduplicate red flags
+  const uniqueFlags = [...new Set(redFlags)];
+
+  return {
+    riskScore: Math.min(score, 100),
+    category,
+    redFlags: uniqueFlags,
+  };
+}
+
+function getRiskLevel(score: number): string {
+  if (score >= 75) return "CRITICAL";
+  if (score >= 50) return "HIGH";
+  if (score >= 25) return "SUSPICIOUS";
+  return "LOW";
+}
+
+function generateRecommendations(category: string, redFlags: string[]): string[] {
+  const recs: string[] = [];
+
+  if (redFlags.some((f) => f.includes("URL"))) {
+    recs.push("Do not click any links in the message");
+  }
+  if (redFlags.some((f) => f.includes("credential") || f.includes("OTP"))) {
+    recs.push("Never share OTP, password, PIN, or CVV with anyone");
+  }
+  if (redFlags.some((f) => f.includes("money") || f.includes("payment"))) {
+    recs.push("Do not send money or make any payments");
+  }
+  if (redFlags.some((f) => f.includes("Urgency"))) {
+    recs.push("Stay calm — scammers create false urgency to force quick action");
+  }
+
+  recs.push("Verify through official channels (official website, app, or customer care)");
+  recs.push("Report suspicious messages to your bank or to cybercrime.gov.in");
+  recs.push("Delete the message and do not forward it to others");
+
+  return [...new Set(recs)];
+}
+
+function generateHindiExplanation(category: string, riskLevel: string, redFlags: string[]): string {
+  const flagText = redFlags.slice(0, 3).join(", ").toLowerCase();
+
+  let base = "";
+  switch (category) {
+    case "Banking/Phishing Scam":
+      base = `यह संदेश एक बैंकिंग फिशिंग घोटाला लगता है। `;
+      break;
+    case "Fake Job Offer":
+      base = `यह संदेश एक नकली नौकरी का ऑफर जैसा दिखता है। `;
+      break;
+    case "UPI/Payment Scam":
+      base = `यह एक UPI/पेमेंट घोटाला हो सकता है। `;
+      break;
+    case "Lottery/Prize Scam":
+      base = `यह एक नकली लॉटरी या इनाम का घोटाला है। `;
+      break;
+    case "Phishing":
+      base = `यह संदेश फिशिंग प्रयास जैसा दिखता है। `;
+      break;
+    default:
+      base = `यह संदेश सामान्य जानकारी जैसा दिखता है। `;
+  }
+
+  const riskMap: Record<string, string> = {
+    CRITICAL: `रिस्क स्तर बहुत ऊंचा है (CRITICAL)। `,
+    HIGH: `रिस्क स्तर ऊंचा है (HIGH)। `,
+    SUSPICIOUS: `यह संदेश संदिग्ध (suspicious) है। `,
+    LOW: `रिस्क स्तर कम है। `,
+  };
+
+  const advice = `मुख्य चेतावनियां: ${flagText || "कोई विशेष चेतावनी नहीं"}. इस संदेश पर विश्वास न करें। किसी भी लिंक पर क्लिक न करें, OTP या पासवर्ड न बताएं, और आधिकारिक स्रोत से सत्यापित करें। संदिग्ध संदेशों की रिपोर्ट cybercrime.gov.in पर करें।`;
+
+  return base + (riskMap[riskLevel] || "") + advice;
+}
+
+// ─── Demo mode responses ────────────────────────────────────────────
+function getDemoResponse(input: string): AnalysisResult {
+  const lower = input.toLowerCase();
+
+  if (hasKeyword(lower, LOTTERY_KEYWORDS) || lower.includes("won") || lower.includes("lottery")) {
+    return {
+      riskScore: 95,
+      riskLevel: "CRITICAL",
+      category: "Lottery/Prize Scam",
+      summary: "This message is a classic lottery/prize scam. You are told you've won something you never entered, and will be asked to pay 'fees' or share bank details to claim it.",
+      redFlags: [
+        "False lottery/prize notification",
+        "Requests for money or payment (processing fee)",
+        "Unsolicited — you did not enter any lottery",
+        "Urgency to claim before deadline",
+      ],
+      recommendations: [
+        "Do not pay any 'processing fee' or 'registration fee'",
+        "Do not share bank account or card details",
+        "Remember: you cannot win a lottery you never entered",
+        "Block and report the sender",
+        "Report to cybercrime.gov.in",
+      ],
+      hindiExplanation: "यह एक नकली लॉटरी या इनाम का घोटाला है। आपने कभी लॉटरी नहीं खरीदी, फिर भी आपको इनाम दिलाया जा रहा है। यह धोखाधड़ी है। कोई फीस न दें, बैंक विवरण न बताएं। इसे cybercrime.gov.in पर रिपोर्ट करें।",
+      demoMode: true,
+    };
+  }
+
+  if (hasKeyword(lower, JOB_KEYWORDS)) {
+    return {
+      riskScore: 88,
+      riskLevel: "HIGH",
+      category: "Fake Job Offer",
+      summary: "This message appears to be a fake job offer. Scammers send unsolicited job offers promising high salary for minimal work, then ask for registration fees or personal documents.",
+      redFlags: [
+        "Unsolicited job offer with unrealistic promises",
+        "High salary for minimal work (too good to be true)",
+        "Requests for money (registration fee)",
+        "No proper company verification",
+        "Urgency to respond immediately",
+      ],
+      recommendations: [
+        "Do not pay any registration or processing fee",
+        "Do not share Aadhaar, PAN, or bank details",
+        "Verify the company on the official MCA portal",
+        "Real companies never ask for fees before hiring",
+        "Report to cybercrime.gov.in",
+      ],
+      hindiExplanation: "यह एक नकली नौकरी का ऑफर है। अचानक नौकरी का प्रस्ताव, ज्यादा तनख्वाह और रजिस्ट्रेशन फीस मांगना — ये सब घोटाले के संकेत हैं। कोई फीस न दें, निजी दस्तावेज न बताएं। असली कंपनियां नौकरी देने से पहले फीस नहीं मांगतीं।",
+      demoMode: true,
+    };
+  }
+
+  if (hasKeyword(lower, UPI_KEYWORDS)) {
+    return {
+      riskScore: 90,
+      riskLevel: "CRITICAL",
+      category: "UPI/Payment Scam",
+      summary: "This message shows signs of a UPI/payment scam. Scammers may ask you to send money, accept a payment request, or 'verify' your UPI ID — all designed to steal funds.",
+      redFlags: [
+        "Suspicious payment/UPI request",
+        "Requests for money or payment",
+        "Requests for sensitive credentials (OTP, password, PIN)",
+        "Urgency/fear manipulation",
+      ],
+      recommendations: [
+        "Never enter your UPI PIN to 'receive' money — receiving money never requires a PIN",
+        "Do not accept unknown payment requests",
+        "Do not share OTP or UPI PIN with anyone",
+        "Verify the requester through official channels",
+        "Report to your bank and cybercrime.gov.in",
+      ],
+      hindiExplanation: "यह एक UPI/पेमेंट घोटाला हो सकता है। याद रखें: पैसे पाने के लिए कभी PIN नहीं लगाता। अगर आपसे पैसे भेजने या 'receive' करने के लिए PIN मांगा जाए, तो यह धोखाधड़ी है। OTP या PIN किसी को न बताएं।",
+      demoMode: true,
+    };
+  }
+
+  if (hasKeyword(lower, BANKING_KEYWORDS) || hasKeyword(lower, PHISHING_KEYWORDS)) {
+    return {
+      riskScore: 92,
+      riskLevel: "CRITICAL",
+      category: "Banking/Phishing Scam",
+      summary: "This message shows multiple phishing indicators commonly used in banking scams. It creates urgency, threatens account suspension, and directs you to a fake link to steal credentials.",
+      redFlags: [
+        "Urgency/fear manipulation (account will be blocked)",
+        "Suspicious URL in message",
+        "Requests for sensitive credentials (OTP, password)",
+        "Banking account phishing attempt",
+        "Misspelled/lookalike domain",
+      ],
+      recommendations: [
+        "Do not click the link in the message",
+        "Do not share OTP, password, or PIN with anyone",
+        "Verify through your bank's official app or website directly",
+        "Banks never ask for KYC via SMS links",
+        "Report to your bank and cybercrime.gov.in",
+      ],
+      hindiExplanation: "यह संदेश एक बैंकिंग फिशिंग घोटाला लगता है। रिस्क स्तर बहुत ऊंचा है (CRITICAL)। मुख्य चेतावनियां: खाता ब्लॉक होने की धमकी, संदिग्ध लिंक, OTP/पासवर्ड मांगना। इस संदेश पर विश्वास न करें। किसी भी लिंक पर क्लिक न करें, OTP या पासवर्ड न बताएं, और बैंक के आधिकारिक ऐप से सत्यापित करें। संदिग्ध संदेशों की रिपोर्ट cybercrime.gov.in पर करें।",
+      demoMode: true,
+    };
+  }
+
+  // Default: safe message
+  return {
+    riskScore: 12,
+    riskLevel: "LOW",
+    category: "Safe/Informational",
+    summary: "This message does not show significant scam indicators. It appears to be a normal informational message. Always stay cautious with unexpected messages.",
+    redFlags: [
+      "No significant scam indicators detected",
+    ],
+    recommendations: [
+      "Stay cautious with unexpected messages",
+      "If in doubt, verify through official channels",
+      "Never share OTP or passwords with anyone",
+    ],
+    hindiExplanation: "यह संदेश सामान्य जानकारी जैसा दिखता है। रिस्क स्तर कम है। इसमें कोई विशेष घोटाले के संकेत नहीं मिले। फिर भी, अचानक आने वाले संदेशों के प्रति सतर्क रहें।",
+    demoMode: true,
+  };
+}
+
+// ─── AI analysis via OpenAI-compatible API ──────────────────────────
+async function getAIAnalysis(input: string): Promise<AnalysisResult | null> {
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+  if (!apiKey) return null;
+
+  try {
+    const prompt = `You are a cybersecurity expert analyzing a suspicious message for Indian users. Analyze this message and respond with ONLY valid JSON (no markdown, no code fences).
+
+Message to analyze:
+"""
+${input}
+"""
+
+Respond with this exact JSON structure:
+{
+  "riskScore": <0-100 integer>,
+  "riskLevel": "<LOW|SUSPICIOUS|HIGH|CRITICAL>",
+  "category": "<short scam category name>",
+  "summary": "<2-3 sentence explanation in English>",
+  "redFlags": ["<flag 1>", "<flag 2>", ...],
+  "recommendations": ["<action 1>", "<action 2>", ...],
+  "hindiExplanation": "<Hindi/Hinglish explanation of the risk and what to do>"
+}
+
+Rules:
+- riskScore 0-20 = LOW, 21-49 = SUSPICIOUS, 50-74 = HIGH, 75-100 = CRITICAL
+- If the message is safe, give a low score and explain why
+- Never claim something is definitely malicious — use "appears", "likely", "suspicious"
+- hindiExplanation should be in Devanagari Hindi or Hinglish`;
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You are a cybersecurity fraud detection expert. Respond only with valid JSON." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.3,
+        max_tokens: 800,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("AI API error:", response.status);
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) return null;
+
+    // Strip markdown code fences if present
+    const cleanJson = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    const parsed = JSON.parse(cleanJson);
+
+    // Validate required fields
+    if (typeof parsed.riskScore !== "number" || !parsed.riskLevel || !parsed.category) {
+      return null;
+    }
+
+    return {
+      riskScore: Math.max(0, Math.min(100, parsed.riskScore)),
+      riskLevel: parsed.riskLevel.toUpperCase(),
+      category: parsed.category,
+      summary: parsed.summary || "",
+      redFlags: Array.isArray(parsed.redFlags) ? parsed.redFlags : [],
+      recommendations: Array.isArray(parsed.recommendations) ? parsed.recommendations : [],
+      hindiExplanation: parsed.hindiExplanation || "",
+      demoMode: false,
+    };
+  } catch (err) {
+    console.error("AI analysis failed:", err.message);
+    return null;
+  }
+}
+
+// ─── Main handler ───────────────────────────────────────────────────
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers: corsHeaders });
+  }
+
+  try {
+    const { input } = await req.json();
+
+    if (!input || typeof input !== "string" || input.trim().length === 0) {
+      return new Response(
+        JSON.stringify({ error: "Input message is required" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      );
+    }
+
+    // 1. Run deterministic security rules
+    const detResult = deterministicAnalyze(input);
+
+    // 2. Try AI analysis
+    const aiResult = await getAIAnalysis(input);
+
+    let finalResult: AnalysisResult;
+
+    if (aiResult) {
+      // Merge: use AI result but add deterministic flags that AI might have missed
+      const mergedFlags = [...new Set([...aiResult.redFlags, ...detResult.redFlags])];
+      finalResult = {
+        ...aiResult,
+        redFlags: mergedFlags,
+        demoMode: false,
+      };
+    } else {
+      // Fallback to demo mode
+      const demo = getDemoResponse(input);
+
+      // Merge deterministic analysis with demo for better accuracy
+      const mergedFlags = [...new Set([...demo.redFlags, ...detResult.redFlags])];
+      const mergedScore = Math.max(demo.riskScore, detResult.riskScore || 0);
+
+      finalResult = {
+        ...demo,
+        redFlags: mergedFlags,
+        riskScore: mergedScore,
+        riskLevel: getRiskLevel(mergedScore),
+        demoMode: true,
+      };
+    }
+
+    // 3. Generate recommendations if missing
+    if (!finalResult.recommendations || finalResult.recommendations.length === 0) {
+      finalResult.recommendations = generateRecommendations(finalResult.category, finalResult.redFlags);
+    }
+
+    // 4. Generate Hindi explanation if missing
+    if (!finalResult.hindiExplanation) {
+      finalResult.hindiExplanation = generateHindiExplanation(finalResult.category, finalResult.riskLevel, finalResult.redFlags);
+    }
+
+    // 5. Ensure risk level matches score
+    finalResult.riskLevel = getRiskLevel(finalResult.riskScore);
+
+    // 6. Save to database
+    const supabaseUrl = Deno.env.get("SUPABASE_URL") || Deno.env.get("VITE_SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+    if (supabaseUrl && serviceRoleKey) {
+      try {
+        const supabase = createClient(supabaseUrl, serviceRoleKey);
+        await supabase.from("analyses").insert({
+          input: input.substring(0, 5000),
+          type: "message",
+          risk_score: finalResult.riskScore,
+          risk_level: finalResult.riskLevel,
+          category: finalResult.category,
+          summary: finalResult.summary,
+          red_flags: finalResult.redFlags,
+          recommendations: finalResult.recommendations,
+          hindi_explanation: finalResult.hindiExplanation,
+        });
+      } catch (dbErr) {
+        console.error("Database save failed:", dbErr.message);
+      }
+    }
+
+    return new Response(
+      JSON.stringify(finalResult),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  } catch (err) {
+    return new Response(
+      JSON.stringify({ error: err.message }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+    );
+  }
+});

@@ -1,0 +1,5 @@
+[functions.analyze-message]
+verify_jwt = false
+
+[functions.analyze-url]
+verify_jwt = false
